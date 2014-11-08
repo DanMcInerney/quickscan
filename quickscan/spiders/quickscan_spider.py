@@ -33,6 +33,9 @@ class Quickscan(CrawlSpider):
     rules = (Rule(LinkExtractor(), callback='parse_resp', follow=True), )
 
     def __init__(self, *args, **kwargs):
+        """
+        Handles args and logging in
+        """
         super(Quickscan, self).__init__(*args, **kwargs)
         self.start_urls = [kwargs.get('url')]
         hostname = urlparse(self.start_urls[0]).hostname
@@ -59,20 +62,22 @@ class Quickscan(CrawlSpider):
             self.http_pass = self.login_pass
 
     def parse_start_url(self, response):
-        ''' Creates the test requests for the start URL as well as the request for robots.txt '''
+        """
+        Creates the test requests for the start URL as well as the request for robots.txt
+        """
         u = urlparse(response.url)
         self.base_url = u.scheme+'://'+u.netloc
         robots_url = self.base_url+'/robots.txt'
         robot_req = [Request(robots_url, callback=self.robot_parser)]
-
         reqs = self.parse_resp(response)
-        reqs += robot_req
-        return reqs
+        yield robot_req
 
     #### Handle logging in if username and password are given as arguments ####
     def start_requests(self):
-        ''' If user and pw args are given, pass the first response to the login handler
-            otherwise pass it to the normal callback function '''
+        """
+        If user and pw args are given, pass the first response to the login handler
+        otherwise pass it to the normal callback function
+        """
         if self.login_user and self.login_pass:
             if self.basic_auth == 'true':
                 yield Request(url=self.start_urls[0]) # Take out the callback arg so crawler falls back to the rules' callback
@@ -82,7 +87,9 @@ class Quickscan(CrawlSpider):
             yield Request(url=self.start_urls[0]) # Take out the callback arg so crawler falls back to the rules' callback
 
     def login(self, response):
-        ''' Fill out the login form and return the request'''
+        """
+        Fill out the login form and return the request
+        """
         self.log('Logging in...')
         try:
             args, url, method = fill_login_form(response.url, response.body, self.login_user, self.login_pass)
@@ -107,7 +114,9 @@ class Quickscan(CrawlSpider):
     ###########################################################################
 
     def robot_parser(self, response):
-        ''' Parse the robots.txt file and create Requests for the disallowed domains '''
+        """
+        Parse the robots.txt file and create Requests for the disallowed domains
+        """
         disallowed_urls = set([])
         for line in response.body.splitlines():
             if 'disallow: ' in line.lower():
@@ -124,8 +133,10 @@ class Quickscan(CrawlSpider):
         return reqs
 
     def parse_resp(self, response):
-        ''' The main response parsing function, called on every response from a new URL
-        Checks for XSS in headers and url'''
+        """
+        The main response parsing function, called on every response from a new URL
+        Checks for XSS in headers and url
+        """
         reqs = []
         orig_url = response.url
         body = response.body
@@ -136,28 +147,23 @@ class Quickscan(CrawlSpider):
             doc = lxml.html.fromstring(body, base_url=orig_url)
         except lxml.etree.ParserError:
             self.log('ParserError from lxml on %s' % orig_url)
-            return
+            return # Might fuck up here
         except lxml.etree.XMLSyntaxError:
             self.log('XMLSyntaxError from lxml on %s' % orig_url)
-            return
+            return # Might fuck up here
 
         # Grab iframe source urls if they are part of the start_url page
         iframe_reqs = self.make_iframe_reqs(doc, orig_url)
-        if iframe_reqs:
-            reqs += iframe_reqs
+        for req in iframe_reqs:
+            yield req
 
-        forms = doc.xpath('//form')
-
-        # Add the original untampered response to each request for use by sqli_check()
-        for r in reqs:
-            r.meta['orig_body'] = body
-
-        # Each Request here will be given a specific callback relative to whether it was URL variables or form inputs that were XSS payloaded
-        return reqs
+        yield Response_analyzer(doc, body, orig_url)
 
     def make_iframe_reqs(self, doc, orig_url):
-        ''' Grab the <iframe src=...> attribute and add those URLs to the
-        queue should they be within the start_url domain '''
+        """
+        Grab the <iframe src=...> attribute and add those URLs to the
+        queue should they be within the start_url domain
+        """
 
         parsed_url = urlparse(orig_url)
         iframe_reqs = []
@@ -185,6 +191,14 @@ class Quickscan(CrawlSpider):
             if url:
                 iframe_reqs.append(Request(url))
 
-        if len(iframe_reqs) > 0:
-            return iframe_reqs
+        #if len(iframe_reqs) > 0:
+        return iframe_reqs
+
+class Response_analyzer():
+    """
+    Returns either None or a list of items
+    """
+
+    def __init__(self, doc, body, orig_url):
+        print '       ' + orig_url
 
