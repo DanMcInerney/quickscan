@@ -61,6 +61,11 @@ class Quickscan(CrawlSpider):
             self.http_user = self.login_user
             self.http_pass = self.login_pass
 
+        # Determine whether we payload all inputs in 1 request or multi
+        # By default (without --fast arg), payload inputs 1 per req
+        self.fast = kwargs.get('fast')
+
+
     def parse_start_url(self, response):
         """
         Creates the test requests for the start URL as well as the request for robots.txt
@@ -68,9 +73,10 @@ class Quickscan(CrawlSpider):
         u = urlparse(response.url)
         self.base_url = u.scheme+'://'+u.netloc
         robots_url = self.base_url+'/robots.txt'
-        robot_req = [Request(robots_url, callback=self.robot_parser)]
+        yield Request(robots_url, callback=self.robot_parser)
+
         reqs = self.parse_resp(response)
-        yield robot_req
+        yield reqs
 
     #### Handle logging in if username and password are given as arguments ####
     def start_requests(self):
@@ -137,27 +143,15 @@ class Quickscan(CrawlSpider):
         The main response parsing function, called on every response from a new URL
         Checks for XSS in headers and url
         """
-        reqs = []
         orig_url = response.url
         body = response.body
+        doc = self.html_parser(body, orig_url)
+        if doc:
+            # Grab iframe source urls if they are part of the start_url page
+            iframe_reqs = self.make_iframe_reqs(doc, orig_url)
+            yield iframe_reqs
 
-        try:
-            # soupparser will handle broken HTML better (like identical attributes) but god damn will you pay for it
-            # in CPU cycles. Slows the script to a crawl and introduces more bugs.
-            doc = lxml.html.fromstring(body, base_url=orig_url)
-        except lxml.etree.ParserError:
-            self.log('ParserError from lxml on %s' % orig_url)
-            return # Might fuck up here
-        except lxml.etree.XMLSyntaxError:
-            self.log('XMLSyntaxError from lxml on %s' % orig_url)
-            return # Might fuck up here
-
-        # Grab iframe source urls if they are part of the start_url page
-        iframe_reqs = self.make_iframe_reqs(doc, orig_url)
-        for req in iframe_reqs:
-            yield req
-
-        yield Response_analyzer(doc, body, orig_url)
+        inputs = self.get_input_vectors(doc, body, orig_url)
 
     def make_iframe_reqs(self, doc, orig_url):
         """
@@ -165,7 +159,6 @@ class Quickscan(CrawlSpider):
         queue should they be within the start_url domain
         """
 
-        parsed_url = urlparse(orig_url)
         iframe_reqs = []
         iframes = doc.xpath('//iframe/@src')
         frames = doc.xpath('//frame/@src')
@@ -194,11 +187,46 @@ class Quickscan(CrawlSpider):
         #if len(iframe_reqs) > 0:
         return iframe_reqs
 
-class Response_analyzer():
-    """
-    Returns either None or a list of items
-    """
+    def get_input_vectors(self, doc, body, orig_url):
+        """
+        Get all the input vectors: params, end of url, forms, headers
+        """
+        all_input = []
+        parsed_url = urlparse(orig_url)
 
-    def __init__(self, doc, body, orig_url):
-        print '       ' + orig_url
+        # End of URL must be alone, but URL params and forms can be combined along with headers
+        params = self.get_url_params(parsed_url)
+
+        # If no params, then we can test the end of the URL
+        if len(params) == 0:
+            if orig_url.endswith('/'):
+                end_of_url = orig_url + '%s'
+            else:
+                end_of_url = orig_url + '/%s'
+
+        #forms = ...
+        #headers = ...
+
+        #all_input = [params, end_of_url, 
+
+    def get_url_params(self, parsed_url):
+        """
+        Get the URL parameters
+        """
+        full_params = parsed_url.query
+        params = parse_qsl(full_params) #parse_qsl rather than parse_ps in order to preserve order
+        return params
+
+    def html_parser(self, html, orig_url):
+        try:
+            # soupparser will handle broken HTML better (like identical attributes) but god damn will you pay for it
+            # in CPU cycles. Slows the script to a crawl and introduces more bugs.
+            doc = lxml.html.fromstring(html, base_url=orig_url)
+        except lxml.etree.ParserError:
+            self.log('ParserError from lxml on %s' % orig_url)
+            return # Might fuck up here
+        except lxml.etree.XMLSyntaxError:
+            self.log('XMLSyntaxError from lxml on %s' % orig_url)
+            return # Might fuck up here
+
 

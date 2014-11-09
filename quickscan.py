@@ -17,6 +17,7 @@ def get_args():
     parser.add_argument('-p', '--password', help="Password; -p pa$$w0rd")
     parser.add_argument('-c', '--connections', default='30', help="Set the max number of simultaneous connections allowed")
     parser.add_argument('--basic', help="Use HTTP Basic Auth to login", action="store_true")
+    parser.add_argument('--fast', help="Payload every input vector on the page in one request", action="store_true")
     args = parser.parse_args()
     return args
 
@@ -25,17 +26,11 @@ def main():
     url = args.url
     user = args.login
     password = args.password
-    if args.basic:
-        basic = 'true'
-    else:
-        basic = 'false'
-    if args.connections:
-        conns = args.connections
     try:
         execute(['scrapy', 'crawl', 'quickscan_spider',
                  '-a', 'url=%s' % url, '-a', 'user=%s' % user, '-a',
-                 'pw=%s' % password, '-s', 'CONCURRENT_REQUESTS=%s' % conns,
-                 '-a', 'basic=%s' % basic])
+                 'pw=%s' % password, '-s', 'CONCURRENT_REQUESTS=%s' % args.connections,
+                 '-a', 'basic=%s' % args.basic, '-a', 'fast=%s' % args.fast])
     except KeyboardInterrupt:
         sys.exit()
 
