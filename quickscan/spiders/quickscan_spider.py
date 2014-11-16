@@ -65,18 +65,24 @@ class Quickscan(CrawlSpider):
         # By default (without --fast arg), payload inputs 1 per req
         self.fast = kwargs.get('fast')
 
-
     def parse_start_url(self, response):
         """
         Creates the test requests for the start URL as well as the request for robots.txt
         """
+        reqs = []
         u = urlparse(response.url)
         self.base_url = u.scheme+'://'+u.netloc
         robots_url = self.base_url+'/robots.txt'
-        yield Request(robots_url, callback=self.robot_parser)
+        robot_req = Request(robots_url, callback=self.robot_parser)
+        payloaded_reqs = self.parse_resp(response)
 
-        reqs = self.parse_resp(response)
-        yield reqs
+        reqs.append(robot_req)
+        if payloaded_reqs is not None:
+            for req in payloaded_reqs:
+                reqs.append(req)
+
+        if len(reqs) > 0:
+            return reqs
 
     #### Handle logging in if username and password are given as arguments ####
     def start_requests(self):
@@ -146,12 +152,24 @@ class Quickscan(CrawlSpider):
         orig_url = response.url
         body = response.body
         doc = self.html_parser(body, orig_url)
-        if doc:
-            # Grab iframe source urls if they are part of the start_url page
-            iframe_reqs = self.make_iframe_reqs(doc, orig_url)
-            yield iframe_reqs
+        reqs = []
 
-        inputs = self.get_input_vectors(doc, body, orig_url)
+        if doc is not None:
+            # Grab iframe source urls if they are part of the start_url page
+            # iframe_reqs returns list of reqs or None
+            iframe_reqs = self.make_iframe_reqs(doc, orig_url)
+            if iframe_reqs is not None:
+                for iframe_req in iframe_reqs:
+                    reqs.append(iframe_req)
+
+        # Returns either list of reqs or None
+        payloaded_reqs = self.payload_reqs(doc, body, orig_url)
+        if payloaded_reqs is not None:
+            for req in payloaded_reqs:
+                reqs.append(req)
+
+        if len(reqs) > 0:
+            return reqs
 
     def make_iframe_reqs(self, doc, orig_url):
         """
@@ -184,30 +202,121 @@ class Quickscan(CrawlSpider):
             if url:
                 iframe_reqs.append(Request(url))
 
-        #if len(iframe_reqs) > 0:
-        return iframe_reqs
+        if len(iframe_reqs) > 0:
+            return iframe_reqs
 
-    def get_input_vectors(self, doc, body, orig_url):
+    def payload_reqs(self, doc, body, orig_url):
         """
         Get all the input vectors: params, end of url, forms, headers
         """
-        all_input = []
         parsed_url = urlparse(orig_url)
+        reqs = []
 
-        # End of URL must be alone, but URL params and forms can be combined along with headers
-        params = self.get_url_params(parsed_url)
-
+        url_params = self.get_url_params(parsed_url)
         # If no params, then we can test the end of the URL
-        if len(params) == 0:
+        # WORK: just add a %s on to end_of_url and it's ready to be payloaded
+        if url_params is not None:
             if orig_url.endswith('/'):
-                end_of_url = orig_url + '%s'
+                end_of_url = orig_url
             else:
-                end_of_url = orig_url + '/%s'
+                end_of_url = orig_url + '/'
+            # If there are params and we still want to test end of URL minus the params
+            #            scheme                  netloc          path
+            #end_of_url = parsed_url[0] + '://' + parsed_url[1] + parsed_url[2]
 
-        #forms = ...
-        #headers = ...
+        form_data = self.get_form_params(orig_url, parsed_url, doc)
+        if form_data is not None:
+            for form in form_data:
+                print 'FORM:', form
 
-        #all_input = [params, end_of_url, 
+        #headers = ... user-agent, referer, shellshock, cookies
+
+#        if fast not None:
+#            # put all the inputs into one request
+#            pass
+#        else:
+#            # make one request per input
+#            pass
+        #{'urls':[urls], 'headers':
+        print 'URL PARAMS:', url_params
+        print ''
+        if len(reqs) > 0:
+            return reqs
+
+    def get_form_params(self, orig_url, parsed_url, doc):
+        """
+        Get all form input, both hidden and explicit, parameters
+        """
+        forms = doc.xpath('//form')
+        url_method_values = []
+
+        for form in forms:
+            if form.inputs:
+                method = form.method
+                post_url = form.action or form.base_url
+                url = self.check_url(post_url, parsed_url)
+                if url and method:
+                    # resets input values for each form
+                    values = []
+                    for i in form.inputs:
+                        if i.name is not None:
+                            # Make sure type(i).__name__ is either a string InputElement or TextareaElement
+                            if type(i).__name__ == 'InputElement':
+                                # Don't change values for the below types because they
+                                # won't be strings and lxml will complain
+                                nonstrings = ['checkbox', 'radio', 'submit', 'reset', 'file']
+                                if i.type in nonstrings:
+                                    continue
+                            elif type(i).__name__ is not 'TextareaElement':
+                                continue
+
+                            # create a list of inputs and their orig value
+                            orig_val = form.fields[i.name]
+                            if orig_val == None:
+                                orig_val = ''
+                            values.append((i.name, orig_val))
+
+                    url_method_values.append((url, method, values))
+                            # Foreign languages might cause this like russian "yaca" for "checkbox"
+                        #    try:
+                        #        form.fields[i.name] = payload
+                        #    except ValueError as e:
+                        #        self.log('Error: '+str(e))
+                        #        continue
+                        #    xss_param = i.name
+                        #    values = form.form_values()
+                        #    # Reset the value
+                        #    try:
+                        #        form.fields[i.name] = orig_val
+                        #    except ValueError as e:
+                        #        self.log('Error resetting form value: '+str(e))
+                        #        continue
+        if len(url_method_values) > 0:
+            return url_method_values
+
+    def check_url(self, post_url, parsed_url):
+        """
+        Confirm there is a POST url in the form element and
+        if it's not a full valid URL, try to put one together
+        """
+
+        # Make sure there's a form action url
+        if post_url == None:
+            self.log('No form action URL found')
+            return
+
+        # Sometimes lxml doesn't read the form.action right
+        if '://' not in post_url:
+            self.log('Form URL contains no scheme, attempting to put together a working form submissions URL')
+            scheme = parsed_url[0]
+            netloc = parsed_url[1]
+            # Make sure we're not doubling the / betwen the netloc and the form action url
+            if post_url.startswith('/'):
+                post_url = post_url[:-1]
+            url = scheme + '://' + netloc + '/' + post_url
+            return url
+        else:
+            return post_url
 
     def get_url_params(self, parsed_url):
         """
@@ -215,18 +324,18 @@ class Quickscan(CrawlSpider):
         """
         full_params = parsed_url.query
         params = parse_qsl(full_params) #parse_qsl rather than parse_ps in order to preserve order
-        return params
+        if len(params) > 0:
+            return params
 
     def html_parser(self, html, orig_url):
         try:
             # soupparser will handle broken HTML better (like identical attributes) but god damn will you pay for it
             # in CPU cycles. Slows the script to a crawl and introduces more bugs.
             doc = lxml.html.fromstring(html, base_url=orig_url)
+            return doc
         except lxml.etree.ParserError:
             self.log('ParserError from lxml on %s' % orig_url)
-            return # Might fuck up here
         except lxml.etree.XMLSyntaxError:
             self.log('XMLSyntaxError from lxml on %s' % orig_url)
-            return # Might fuck up here
 
 

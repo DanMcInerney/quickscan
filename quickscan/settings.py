@@ -36,4 +36,5 @@ ITEM_PIPELINES = {'quickscan.pipelines.Resp_analyzer':100}
 #FEED_URI = 'example.txt'
 
 CONCURRENT_REQUESTS = 30
+DOWNLOAD_DELAY = 0
 
